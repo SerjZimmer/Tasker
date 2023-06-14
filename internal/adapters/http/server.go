@@ -1,36 +1,49 @@
 package http
 
 import (
+	"errors"
+	"fmt"
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt"
-	"golang.org/x/crypto/bcrypt"
+	"log"
 	"net/http"
-	"time"
+	"sync"
+	"tasker/internal/configs"
+	"tasker/internal/domain"
 )
 
 // Мапа для хранения состояния отзыва refresh-токенов
 var revokedTokens = make(map[string]bool)
+var accessClaims = make(map[string]string)
+
+// hadler - валидация моделей + полученных из http-сервер
+// logic - валидация доступа, генерация токенов
+// storage - получение моделей пользователей из мапы и пометка токенов как невалидные
 
 // Server представляет HTTP-сервер
 type Server struct {
 	router *gin.Engine
-	config Config
-}
+	config configs.Config
+	auth   *domain.AuthService
+	logout *domain.LogOutService
 
-// Config представляет конфигурацию для HTTP-сервера
-type Config struct {
-	AccessSecret  []byte
-	RefreshSecret []byte
-	Port          string
+	mu sync.RWMutex // sync.Mutex
 }
 
 // NewServer создает и возвращает новый HTTP-сервер с заданной конфигурацией
-func NewServer(config Config) *Server {
+func NewServer(config configs.Config) *Server {
 	router := gin.Default()
 	server := &Server{
 		router: router,
 		config: config,
 	}
+
+	// middleware1 -> middleware2 -> handler -> midlerware3
+	router.Use(func(c *gin.Context) {
+		c.Next()
+		if c.Request.Response.StatusCode != http.StatusOK {
+			log.Println("error", c)
+		}
+	})
 
 	router.GET("/login", server.handleLogin)
 	router.GET("/logout", server.handleLogout)
@@ -50,95 +63,60 @@ func (s *Server) Start() error {
 func (s *Server) handleLogin(c *gin.Context) {
 	username := c.Query("username")
 	password := c.Query("password")
-
-	// Проверка логина и пароля
-	if !isValidCredentials(username, password) {
-		c.String(http.StatusUnauthorized, "Неверный логин или пароль")
-		return
-	}
-
 	refreshTokenValue := c.Query("refresh_token")
-	if revokedTokens[refreshTokenValue] {
-		c.String(http.StatusUnauthorized, "Refresh-токен невалидный.")
-		return
+	username, _, err := s.auth.Auth(username, password)
+	if err != nil {
+		c.String(http.StatusUnauthorized, "Неверный логин или пароль")
+		fmt.Println(err)
 	}
-
-	// Создание access токена
-	accessExp := time.Now().Add(5 * time.Minute)
-	accessClaims := jwt.MapClaims{
-		"username": username,
-		"exp":      accessExp.Unix(),
-	}
-	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-	accessString, err := accessToken.SignedString(s.config.AccessSecret)
+	_, refreshString, err := s.auth.Refresh(revokedTokens, username, refreshTokenValue)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
-		return
+		fmt.Println(err)
+	} else {
+		// Установка токенов в виде cookie
+		c.SetCookie("access_token", accessString, int(accessExp.Unix()), "/", "", false, true)
+		c.SetCookie("refresh_token", refreshString, int(refreshExp.Unix()), "/", "", false, true)
+		c.String(http.StatusOK, "Аутентификация успешна. Токены выданы.")
 	}
 
-	// Создание refresh токена
-	refreshExp := time.Now().Add(60 * time.Minute)
-	refreshClaims := jwt.MapClaims{
-		"username": username,
-		"exp":      refreshExp.Unix(),
-	}
-	refreshToken := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims)
-
-	refreshString, err := refreshToken.SignedString(s.config.RefreshSecret)
-	if err != nil {
-		c.String(http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	// Установка токенов в виде cookie
-	c.SetCookie("access_token", accessString, int(accessExp.Unix()), "/", "", false, true)
-	c.SetCookie("refresh_token", refreshString, int(refreshExp.Unix()), "/", "", false, true)
-
-	c.String(http.StatusOK, "Аутентификация успешна. Токены выданы.")
 }
 
 func (s *Server) handleVerify(c *gin.Context) {
+	// HANDLER LOGIC
 	accessToken, err := c.Cookie("access_token")
 	if err != nil {
 		c.String(http.StatusUnauthorized, "Отсутствует access токен")
 		return
 	}
 
-	// Проверка и верификация access токена
-	accessClaims := jwt.MapClaims{}
-	_, err = jwt.ParseWithClaims(accessToken, accessClaims, func(token *jwt.Token) (interface{}, error) {
-		return s.config.AccessSecret, nil
-	})
-	if err != nil {
-		c.String(http.StatusUnauthorized, "Неверный access токен")
-		return
-	}
-
-	// Проверка и обновление refresh токена, если он передан
 	refreshToken, err := c.Cookie("refresh_token")
 	if err == nil {
-		refreshClaims := jwt.MapClaims{}
-		_, err = jwt.ParseWithClaims(refreshToken, refreshClaims, func(token *jwt.Token) (interface{}, error) {
-			return s.config.RefreshSecret, nil
-		})
-		if err == nil && refreshClaims.VerifyExpiresAt(time.Now().Unix(), true) {
-			// Создание нового access токена
-			newAccessExp := time.Now().Add(5 * time.Minute)
-			newAccessClaims := jwt.MapClaims{
-				"username": accessClaims["username"],
-				"exp":      newAccessExp.Unix(),
-			}
-			newAccessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newAccessClaims)
-			newAccessString, err := newAccessToken.SignedString(s.config.AccessSecret)
-			if err != nil {
-				c.String(http.StatusInternalServerError, err.Error())
+		c.String(http.StatusUnauthorized, "Отсутствует access токен")
+		return
+	}
+	{
+		// BUISNESS LOGIC
+		err := s.auth.Verify(accessToken, refreshToken)
+		if err != nil {
+
+			if errors.Is(err, domain.ErrTokenNotValid) {
+				c.String(http.StatusUnauthorized, "Неверный access токен")
 				return
 			}
 
-			// Обновление токена в виде cookie
-			c.SetCookie("access_token", newAccessString, int(newAccessExp.Unix()), "/", "", false, true)
+			c.String(http.StatusInternalServerError, err.Error())
+			return
 		}
+		acess, refresh, err := s.auth.Generate(accessClaims)
+		if err != nil {
+			return err
+		}
+
 	}
+
+	// Обновление токена в виде cookie
+	c.SetCookie("access_token", newAccessString, int(newAccessExp.Unix()), "/", "", false, true)
 
 	c.String(http.StatusOK, "Токены прошли верификацию и обновление, если необходимо.")
 }
@@ -146,47 +124,11 @@ func (s *Server) handleVerify(c *gin.Context) {
 func (s *Server) handleLogout(c *gin.Context) {
 	refreshToken, err := c.Cookie("refresh_token")
 	if err != nil {
-		c.String(http.StatusUnauthorized, "Отсутствует refresh токен")
-		return
+		c.String(http.StatusUnauthorized, err.Error())
 	}
-
-	// Проверка и верификация refresh токена
-	refreshClaims := jwt.MapClaims{}
-	_, err = jwt.ParseWithClaims(refreshToken, refreshClaims, func(token *jwt.Token) (interface{}, error) {
-		return s.config.RefreshSecret, nil
-	})
+	err = s.logout.CheckToken(refreshToken, revokedTokens)
 	if err != nil {
-		c.String(http.StatusUnauthorized, "Неверный refresh токен")
-		return
+		c.String(http.StatusUnauthorized, err.Error())
 	}
-
-	// Пометка refresh-токена как невалидного
-	revokedTokens[refreshToken] = true
-
-	// Удаление refresh-токена из cookie
-	c.SetCookie("refresh_token", "", -1, "/", "", false, true)
-
 	c.String(http.StatusOK, "Выход выполнен успешно. Refresh-токен помечен как невалидный.")
-}
-
-func isValidCredentials(username, password string) bool {
-	// Фиктивный пользователь для тестирования
-	fakeUsername := "admin"
-	fakePassword := "password"
-	fakeHashedPassword, err := bcrypt.GenerateFromPassword([]byte(fakePassword), bcrypt.DefaultCost)
-	if err != nil {
-		return false
-	}
-
-	if username != fakeUsername {
-		return false
-	}
-
-	// Сравнение предоставленного пароля с хэшем фиктивного пароля
-	err = bcrypt.CompareHashAndPassword(fakeHashedPassword, []byte(password))
-	if err != nil {
-		return false
-	}
-
-	return true
 }
