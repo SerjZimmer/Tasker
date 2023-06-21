@@ -22,7 +22,7 @@ var accessClaims = make(map[string]string)
 // Server представляет HTTP-сервер
 type Server struct {
 	router *gin.Engine
-	config configs.Config
+	Config configs.Config
 	auth   *domain.AuthService
 	logout *domain.LogOutService
 
@@ -34,7 +34,7 @@ func NewServer(config configs.Config) *Server {
 	router := gin.Default()
 	server := &Server{
 		router: router,
-		config: config,
+		Config: config,
 	}
 
 	// middleware1 -> middleware2 -> handler -> midlerware3
@@ -53,13 +53,12 @@ func NewServer(config configs.Config) *Server {
 }
 
 func (s *Server) Start() error {
-	err := s.router.Run(":" + s.config.Port)
+	err := s.router.Run(":" + s.Config.Port)
 	if err != nil {
 		return err
 	}
 	return nil
 }
-
 func (s *Server) handleLogin(c *gin.Context) {
 	username := c.Query("username")
 	password := c.Query("password")
@@ -68,18 +67,19 @@ func (s *Server) handleLogin(c *gin.Context) {
 	if err != nil {
 		c.String(http.StatusUnauthorized, "Неверный логин или пароль")
 		fmt.Println(err)
+		return
 	}
-	_, refreshString, err := s.auth.Refresh(revokedTokens, username, refreshTokenValue)
+	accessString, refreshString, err := s.auth.Refresh(revokedTokens, username, refreshTokenValue)
 	if err != nil {
 		c.String(http.StatusInternalServerError, err.Error())
 		fmt.Println(err)
+		return
 	} else {
 		// Установка токенов в виде cookie
 		c.SetCookie("access_token", accessString, int(accessExp.Unix()), "/", "", false, true)
 		c.SetCookie("refresh_token", refreshString, int(refreshExp.Unix()), "/", "", false, true)
 		c.String(http.StatusOK, "Аутентификация успешна. Токены выданы.")
 	}
-
 }
 
 func (s *Server) handleVerify(c *gin.Context) {
@@ -91,28 +91,26 @@ func (s *Server) handleVerify(c *gin.Context) {
 	}
 
 	refreshToken, err := c.Cookie("refresh_token")
-	if err == nil {
-		c.String(http.StatusUnauthorized, "Отсутствует access токен")
+	if err != nil {
+		c.String(http.StatusUnauthorized, "Отсутствует refresh токен")
 		return
 	}
-	{
-		// BUISNESS LOGIC
-		err := s.auth.Verify(accessToken, refreshToken)
-		if err != nil {
 
-			if errors.Is(err, domain.ErrTokenNotValid) {
-				c.String(http.StatusUnauthorized, "Неверный access токен")
-				return
-			}
-
-			c.String(http.StatusInternalServerError, err.Error())
+	// BUSINESS LOGIC
+	err = s.auth.Verify(accessToken, refreshToken)
+	if err != nil {
+		if errors.Is(err, domain.ErrTokenNotValid) {
+			c.String(http.StatusUnauthorized, "Неверный access токен")
 			return
 		}
-		acess, refresh, err := s.auth.Generate(accessClaims)
-		if err != nil {
-			return err
-		}
+		c.String(http.StatusInternalServerError, err.Error())
+		return
+	}
 
+	newAccessString, _, err := s.auth.Generate(accessClaims)
+	if err != nil {
+		// Обработка ошибки
+		return
 	}
 
 	// Обновление токена в виде cookie

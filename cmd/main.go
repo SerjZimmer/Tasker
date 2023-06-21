@@ -7,11 +7,7 @@ import (
 
 func main() {
 	// Конфигурация HTTP-сервера
-	config := http.Config{
-		AccessSecret:  []byte("your-access-secret"),
-		RefreshSecret: []byte("your-refresh-secret"),
-		Port:          "8080",
-	}
+	config := http.Server{}.Config
 
 	// Создание HTTP-сервера
 	server := http.NewServer(config)

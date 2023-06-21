@@ -52,13 +52,13 @@ func (s *AuthService) Auth(username, password string) (string, string, error) {
 	}
 	return username, password, nil
 }
-func (s *AuthService) Refresh(revokedTokens map[string]bool, username, refreshTokenValue string) (*jwt.Token, string, error) {
+func (s *AuthService) Refresh(revokedTokens map[string]bool, username, refreshTokenValue string) (string, error) {
 
 	s.mu.RLock()
 	// defer s.mu.RUnlock()
 	if revokedTokens[refreshTokenValue] {
 		s.mu.RUnlock()
-		return nil, "", ErrTokenNotValid
+		return "", ErrTokenNotValid
 	}
 	s.mu.RUnlock()
 
@@ -69,9 +69,9 @@ func (s *AuthService) Refresh(revokedTokens map[string]bool, username, refreshTo
 		"exp":      accessExp.Unix(),
 	}
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims)
-	accessString, err := accessToken.SignedString(s.config.AccessSecret)
+	_, err := accessToken.SignedString(s.config.AccessSecret)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 
 	// Создание refresh токена
@@ -84,9 +84,9 @@ func (s *AuthService) Refresh(revokedTokens map[string]bool, username, refreshTo
 
 	refreshString, err := refreshToken.SignedString(s.config.RefreshSecret)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
-	return refreshToken, refreshString, nil
+	return refreshString, nil
 }
 
 func isValidCredentials(username, password string) bool {
